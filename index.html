@@ -1,3 +1,4 @@
+<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
 <!DOCTYPE html>
 <html lang="ko">
 <head>
@@ -75,6 +76,8 @@ canvas{max-width:100%;max-height:100%;box-shadow:0 8px 28px var(--paper-shadow);
 .plan .note.ok{color:var(--ok)}
 .plan .note.bad{color:var(--bad)}
 input[type=file]{display:none}
+.radio{display:flex;align-items:center;gap:6px;font-size:13px;color:#E8EDF5;cursor:pointer}
+.radio input{accent-color:var(--accent);width:16px;height:16px;margin:0}
 
 @media (max-width:860px){
   body{flex-direction:column}
@@ -133,8 +136,21 @@ input[type=file]{display:none}
     <div class="hint">번호:페이지수 형식. 특정 학생만 페이지가 더 많을 때(예: 5번 학생 4쪽) 지정하세요.</div>
   </div>
 
+  <div class="field">
+    <label>⑥ 저장 방식</label>
+    <div class="row" style="gap:16px;align-items:center;flex-wrap:wrap">
+      <label class="radio"><input type="radio" name="mode" value="zip" checked> ZIP 파일 하나로</label>
+      <label class="radio"><input type="radio" name="mode" value="folder" id="modeFolder"> 폴더에 바로 저장</label>
+    </div>
+    <div class="row" id="folderRow" hidden style="margin-top:8px">
+      <input type="text" id="folderName" placeholder="폴더를 선택하세요" readonly>
+      <button class="btn" id="folderBtn" type="button">선택</button>
+    </div>
+    <div class="hint" id="folderHint"></div>
+  </div>
+
   <div class="run">
-    <button class="btn primary run-btn" id="runBtn" type="button" disabled>일괄 분할 → ZIP 저장</button>
+    <button class="btn primary run-btn" id="runBtn" type="button" disabled>일괄 분할 시작</button>
     <div class="status" id="status"></div>
   </div>
 </aside>
@@ -284,35 +300,73 @@ function updateFname(){
 for (const id of ["prefix","suffix","interval","skip","exceptions"])
   $(id).addEventListener("input", () => { updateFname(); updatePlan(); });
 
-// ── 분할 실행 ──
+// ── 저장 방식 ──
 let downloads = null;
 if (window.claude?.use) claude.use("downloads").then(d => { downloads = d; });
+
+const canPickFolder = typeof window.showDirectoryPicker === "function";
+let dirHandle = null;
+if (!canPickFolder){
+  $("modeFolder").disabled = true;
+  $("folderHint").textContent = "폴더 직접 저장은 Chrome·Edge에서만 지원됩니다. 이 브라우저에서는 ZIP으로 저장됩니다.";
+}
+function mode(){ return document.querySelector('input[name=mode]:checked').value; }
+function updateMode(){
+  const folder = mode() === "folder";
+  $("folderRow").hidden = !folder;
+  $("runBtn").textContent = folder ? "일괄 분할 → 폴더에 저장" : "일괄 분할 → ZIP 저장";
+}
+document.querySelectorAll('input[name=mode]').forEach(r => r.addEventListener("change", updateMode));
+updateMode();
+
+$("folderBtn").onclick = async () => {
+  try{
+    dirHandle = await window.showDirectoryPicker({ mode: "readwrite" });
+    $("folderName").value = dirHandle.name;
+    $("folderHint").textContent = "";
+  }catch(err){ if (err.name !== "AbortError") setStatus("폴더를 열 수 없습니다: " + err.message, "bad"); }
+};
+
+async function saveToFolder(name, bytes){
+  const fh = await dirHandle.getFileHandle(name, { create: true });
+  const w = await fh.createWritable();
+  await w.write(bytes); await w.close();
+}
+
+// ── 분할 실행 ──
 
 $("runBtn").onclick = async () => {
   let s;
   try{ s = readSettings(); }catch(err){ setStatus(err.message, "bad"); return; }
   if (!s.prefix){ setStatus("학년/반 앞자리를 입력하세요. (예: 109)", "bad"); $("prefix").focus(); return; }
+  const toFolder = mode() === "folder";
+  if (toFolder && !dirHandle){ setStatus("저장할 폴더를 먼저 선택하세요.", "bad"); return; }
   const { items, warnings } = buildPlan(state.total, s);
   const btn = $("runBtn"); btn.disabled = true; btn.textContent = "처리 중…";
   try{
     const src = await PDFLib.PDFDocument.load(state.bytes);
-    const zip = new JSZip();
+    const zip = toFolder ? null : new JSZip();
     for (let i = 0; i < items.length; i++){
       const it = items[i];
       const out = await PDFLib.PDFDocument.create();
       const range = Array.from({ length: it.to - it.from + 1 }, (_, k) => it.from + k);
       const pages = await out.copyPages(src, range);
       pages.forEach(p => out.addPage(p));
-      zip.file(it.name, await out.save());
+      const bytes = await out.save();
+      if (toFolder) await saveToFolder(it.name, bytes); else zip.file(it.name, bytes);
       setStatus(`진행: ${i+1} / ${items.length}명 (${it.to+1} / ${state.total}쪽)`);
     }
-    const blob = await zip.generateAsync({ type:"blob" });
-    const zipName = `${s.prefix}${s.suffix || ""}_분할.zip`;
-    await deliver(zipName, blob);
-    setStatus(`✓ ${items.length}명 파일 완성 → ${zipName}` + (warnings.length ? "\n⚠ " + warnings.join("\n") : ""), warnings.length ? "warn" : "ok");
+    let where;
+    if (toFolder){ where = `${dirHandle.name} 폴더`; }
+    else {
+      const blob = await zip.generateAsync({ type:"blob" });
+      where = `${s.prefix}${s.suffix || ""}_분할.zip`;
+      await deliver(where, blob);
+    }
+    setStatus(`✓ ${items.length}명 파일 완성 → ${where}` + (warnings.length ? "\n⚠ " + warnings.join("\n") : ""), warnings.length ? "warn" : "ok");
   }catch(err){
-    setStatus(err.code === "declined" ? "저장을 취소했습니다." : "오류: " + (err.message || err), "bad");
-  }finally{ btn.disabled = false; btn.textContent = "일괄 분할 → ZIP 저장"; }
+    setStatus(err.code === "declined" || err.name === "AbortError" ? "저장을 취소했습니다." : "오류: " + (err.message || err), "bad");
+  }finally{ btn.disabled = false; updateMode(); }
 };
 
 async function deliver(filename, blob){
@@ -328,3 +382,5 @@ function setStatus(msg, kind=""){ const el = $("status"); el.textContent = msg; 
 </script>
 </body>
 </html>
+
+</body></html>
